@@ -1,0 +1,49 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+env/
+*.venv
+*.env
+
+# Environment variables
+.env
+*.env
+
+# Logs
+logs/
+*.log
+
+# Database files
+*.sqlite3
+*.db
+
+# Instance folder (Flask-specific)
+instance/
+
+# PyCharm files
+.idea/
+
+# VSCode settings
+.vscode/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Cache
+.cache/
+pip-wheel-metadata/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Compiled C extensions
+*.so
+
+# Flask secret key file (if any)
+secret_key.txt
