@@ -3,12 +3,17 @@ import tensorflow as tf
 import numpy as np
 import pandas as pd
 from flask_cors import CORS
+from sklearn.preprocessing import StandardScaler
+import joblib 
 
 app = Flask(__name__)
 CORS(app) 
 
 MODEL_PATH = "lstm_multilabel_anomalie_normal_model.h5"
+SCALER_PATH = "scaler.pkl"
 model = tf.keras.models.load_model(MODEL_PATH)
+scaler = joblib.load(SCALER_PATH)
+# scaler = StandardScaler()
 
 FEATURE_COLUMNS = [
     "Status_Type", "Rotor_Speed", "Rotational_Speed",
@@ -36,18 +41,31 @@ def predict():
         if "Timestamp" not in df.columns:
             return jsonify({"error": "Missing Timestamp"}), 400
 
-        # Extract "Hour" from Timestamp
+        # Extract "Month" from Timestamp
         df["Month"] = pd.to_datetime(df["Timestamp"]).dt.month
 
         # Ensure all required features exist
         if not all(col in df.columns for col in FEATURE_COLUMNS):
             return jsonify({"error": "Missing required features"}), 400
 
-        input_data = df[FEATURE_COLUMNS].values.astype(np.float32)
+        # Select only the relevant feature columns
+        input_data = df[FEATURE_COLUMNS].copy()
+
+
+        # Scale the numerical features
+        numerical_columns = [col for col in FEATURE_COLUMNS if col not in ["Status_Type, Asset_ID", "Timestamp"]]  # Exclude categorical columns
+
+        # Fit and transform the numerical columns only (scaling)
+        input_data[numerical_columns] = scaler.fit_transform(input_data[numerical_columns])
+
+        # Convert to the correct shape for the model
+        input_data = input_data.values.astype(np.float32)
         input_data = np.expand_dims(input_data, axis=1)  # Reshape to (batch_size, 1, features)
 
+        # Make predictions
         predictions = model.predict(input_data)
 
+        # Prepare results
         results = []
         for i, pred in enumerate(predictions):
             predicted_classes = [CLASS_LABELS[j] for j, value in enumerate(pred) if value > 0.5]  # Adjust threshold
