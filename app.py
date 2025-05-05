@@ -162,11 +162,11 @@ def predict_forecast():
         if "Timestamp" in df.columns:
             df["Timestamp"] = pd.to_datetime(df["Timestamp"])
             df = df.set_index("Timestamp")
-        df = df[['Power_Output']]
+
+        df = df[['Power_Output']].interpolate(method='linear')
+        
+        # Resample and fill any new missing values
         df = df.resample('h').mean()
-        if not isinstance(df, pd.DataFrame):
-            df = pd.DataFrame(df)
-        df = df.asfreq('h')
         df = df.interpolate(method='linear')
         
         # Create dummy DataFrame for scaling
@@ -205,7 +205,7 @@ def predict_forecast():
         } for ts, value in zip(forecast_timestamps, forecast_power)])
         
     except Exception as e:
-        return jsonify({"error": f"{str(e)} data: {len(data)}"}), 500
+        return jsonify({"error": f"{str(e)} data: {len(df)}"}), 500
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
