@@ -7,6 +7,9 @@ from sklearn.preprocessing import StandardScaler
 import datetime
 import joblib 
 from statsmodels.tsa.seasonal import MSTL
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, precision_score, recall_score, f1_score
+from sklearn.model_selection import train_test_split
+from itertools import combinations
 
 app = Flask(__name__)
 CORS(app) 
@@ -206,6 +209,178 @@ def predict_forecast():
         
     except Exception as e:
         return jsonify({"error": f"{str(e)} data: {len(df)}"}), 500
+
+
+MODEL_FILES = {
+    "lstm": "LSTM_18_best_model.h5",
+    "cnn": "CNN_18_best_model.h5",
+    "rnn": "rnn_18_best_model.h5",
+}
+
+def load_all_models():
+    models = {}
+    for key, path in MODEL_FILES.items():
+        models[key] = tf.keras.models.load_model(path)
+    return models
+
+# Load models (you can preload or load on-demand)
+models = load_all_models()
+
+def prepare_evaluation_data(y_test, model, X_test, thresholds):
+    y_test_np = y_test.to_numpy() if hasattr(y_test, "to_numpy") else y_test
+    y_pred_probs = model.predict(X_test)
+    y_pred_np = (y_pred_probs > np.array(thresholds)).astype(int)
+    # Add "normal" class where all zeros
+    normal_class_pred = np.all(y_pred_np == 0, axis=1).reshape(-1,1)
+    normal_class_test = np.all(y_test_np == 0, axis=1).reshape(-1,1)
+    y_pred_np = np.hstack([y_pred_np, normal_class_pred])
+    y_test_np = np.hstack([y_test_np, normal_class_test])
+    return y_test_np, y_pred_np
+
+def global_evaluation(y_test_np, y_pred_np, class_columns):
+    accuracy = accuracy_score(y_test_np, y_pred_np)
+    report = classification_report(y_test_np, y_pred_np, target_names=class_columns, digits=4, output_dict=True)
+    return accuracy, report
+
+def multi_label_evaluation(y_test_np, y_pred_np, class_columns):
+    accuracy, report = global_evaluation(y_test_np, y_pred_np, class_columns)
+    return {"accuracy": accuracy, "classification_report": report}
+
+def class_pair_evaluation(y_test_np, y_pred_np, class_columns):
+    pairs = list(combinations(range(len(class_columns)), 2))
+    metrics = []
+
+    two_active_mask = np.sum(y_test_np, axis=1) == 2
+    if np.any(two_active_mask):
+        accuracy = accuracy_score(y_test_np[two_active_mask], y_pred_np[two_active_mask])
+    else:
+        accuracy = None
+
+    for i, j in pairs:
+        pair_name = f"{class_columns[i]} & {class_columns[j]}"
+        mask = (y_test_np[:, i] == 1) & (y_test_np[:, j] == 1)
+        support = np.sum(mask)
+
+        if support > 0:
+            y_true_pair = y_test_np[mask][:, [i, j]]
+            y_pred_pair = y_pred_np[mask][:, [i, j]]
+
+            precision = precision_score(y_true_pair, y_pred_pair, average='samples', zero_division=0)
+            recall = recall_score(y_true_pair, y_pred_pair, average='samples', zero_division=0)
+            f1 = f1_score(y_true_pair, y_pred_pair, average='samples', zero_division=0)
+
+            metrics.append({"pair": pair_name, "precision": precision, "recall": recall, "f1_score": f1, "support": support})
+
+    return {"accuracy_two_active": accuracy, "pair_metrics": metrics}
+
+def evaluate_single_class(y_test_np, y_pred_np, class_columns):
+    normal_idx = class_columns.index("normal")
+    mask = (y_test_np.sum(axis=1) == 1) & (y_test_np[:, normal_idx] == 0)
+
+    y_filtered = y_test_np[mask]
+    if len(y_filtered) == 0:
+        return {"message": "No samples with exactly one active class found."}
+
+    y_pred_filtered = y_pred_np[mask]
+
+    accuracy, report = global_evaluation(y_filtered, y_pred_filtered, class_columns)
+    return {"accuracy": accuracy, "classification_report": report}
+
+def evaluate_normal_vs_abnormal(y_test_np, y_pred_np, class_columns):
+    normal_idx = class_columns.index("normal")
+    y_test_binary = (y_test_np[:, normal_idx] == 1).astype(int)
+    y_pred_binary = (y_pred_np[:, normal_idx] == 1).astype(int)
+
+    accuracy, report = global_evaluation(y_test_binary, y_pred_binary, ["Abnormal", "Normal"])
+    return {"accuracy": accuracy, "classification_report": report}
+
+def evaluate_model(model, X_test, y_test, class_columns, thresholds):
+    y_test_np, y_pred_np = prepare_evaluation_data(y_test, model, X_test, thresholds)
+    class_columns_with_normal = class_columns + ["normal"]
+
+    return {
+        "multi_label_evaluation": multi_label_evaluation(y_test_np, y_pred_np, class_columns_with_normal),
+        "class_pair_evaluation": class_pair_evaluation(y_test_np, y_pred_np, class_columns_with_normal),
+        "evaluate_single_class": evaluate_single_class(y_test_np, y_pred_np, class_columns_with_normal),
+        "evaluate_normal_vs_abnormal": evaluate_normal_vs_abnormal(y_test_np, y_pred_np, class_columns_with_normal)
+    }
+
+
+tf.config.run_functions_eagerly(True)
+tf.compat.v1.enable_eager_execution()
+
+
+@app.route('/tune_models', methods=['POST'])
+def admin_tune_models():
+    try:
+        data = request.json
+        if not data or not isinstance(data, list):
+            return jsonify({"error": "Input data must be a non-empty array"}), 400
+
+        df = pd.DataFrame(data)
+
+        if "Timestamp" not in df.columns:
+            return jsonify({"error": "Missing Timestamp"}), 400
+
+        if "Month" not in df.columns:
+            df["Month"] = pd.to_datetime(df["Timestamp"]).dt.month
+
+        missing_features = [col for col in FEATURE_COLUMNS if col not in df.columns]
+        if missing_features:
+            return jsonify({"error": f"Missing required feature columns: {missing_features}"}), 400
+
+        missing_labels = [col for col in CLASS_LABELS if col not in df.columns]
+        if missing_labels:
+            return jsonify({"error": f"Missing fault label columns: {missing_labels}"}), 400
+
+        if "Asset_ID" in df.columns:
+            df = df.drop("Asset_ID", axis=1)
+
+        df = df.drop("Timestamp", axis=1)
+
+        X = df[FEATURE_COLUMNS].values.astype(np.float32)
+        y = df[CLASS_LABELS].values.astype(int)
+        X = np.expand_dims(X, axis=1)
+
+        from sklearn.model_selection import train_test_split
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+        epochs = 1
+        batch_size = 32
+
+        evaluation_results = {}
+
+        for model_name, model in models.items():
+            model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+            model.fit(X_train, y_train, epochs=epochs, batch_size=batch_size, verbose=1)
+
+            model.save(f'{model_name}_tuned.h5')
+
+            thresholds = [0.5] * len(CLASS_LABELS)
+            evaluation_results[model_name] = evaluate_model(model, X_test, y_test, CLASS_LABELS, thresholds)
+
+        def convert_numpy_types(obj):
+            if isinstance(obj, dict):
+                return {k: convert_numpy_types(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_numpy_types(i) for i in obj]
+            elif isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            else:
+                return obj
+
+        cleaned_evaluation_results = convert_numpy_types(evaluation_results)
+
+        return jsonify({"message": "Models tuned successfully", "evaluation": cleaned_evaluation_results})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
