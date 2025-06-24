@@ -1055,13 +1055,16 @@ def get_model_info(directory):
                 if file.endswith('.h5'):
                     model_path = os.path.join(model_dir, file)
                     is_current = "(current)" in file.lower()
-                    
+                    creation_timestamp = os.path.getctime(model_path)
+                    creation_date = datetime.datetime.fromtimestamp(creation_timestamp).strftime('%Y-%m-%d %H:%M')
+                    print(creation_timestamp)
                     models.append({
                         "name": model_name,
                         "version": file.replace('.h5', '').replace('(current)', '').strip(),
                         "path": model_path,
                         "is_current": is_current,
-                        "is_tuned": "_tuned" in file.lower()
+                        "is_tuned": "_tuned" in file.lower(),
+                        "creation_date": creation_date,
                     })
                     
                     if is_current:
