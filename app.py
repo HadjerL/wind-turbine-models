@@ -11,8 +11,17 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 from sklearn.model_selection import train_test_split
 from itertools import combinations
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-import glob
+# import glob
+from tensorflow import keras
 import os
+from tensorflow.keras.models import Sequential, clone_model
+from tensorflow.keras.layers import (
+    Conv1D, Flatten, Dense, LSTM, SimpleRNN, Dropout, GlobalAveragePooling1D, MaxPooling1D
+)
+from tensorflow.keras.optimizers import Adam, SGD
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.metrics import RootMeanSquaredError
+import keras_tuner as kt
 
 app = Flask(__name__)
 CORS(app) 
@@ -92,6 +101,7 @@ CLASS_LABELS = [
 # Generate the dictionaries dynamically
 MODEL_FILES, FORECAST_MODEL_FILES = get_model_dicts()
 
+TUNER_DIR = "tuner"
 #-------------------------------------------------------------------------------------------------------------------
 #---------------------Data preparation---------------------------------------------------
 def add_mstl_components(data, periods=[12, 24]):
@@ -838,8 +848,8 @@ def tune_forecast():
 #---------------------Evalution---------------------------------------------------------------
 
 
-@app.route('/evaluate_classification_model/<model_name>/<version>', methods=['POST'])
-def evaluate_classification_model(model_name, version):
+@app.route('/evaluate_classification_model/<model_name>/<architecture>/<version>', methods=['POST'])
+def evaluate_classification_model(model_name, architecture, version):
     try:
         data = request.json
         if not data or not isinstance(data, list):
@@ -875,18 +885,22 @@ def evaluate_classification_model(model_name, version):
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
         # Load the specific model version
-        model_path = os.path.join(CLASSIFICATION_MODEL_DIR, model_name, f"v{version}.h5")
+        model_path = os.path.join(CLASSIFICATION_MODEL_DIR, architecture, model_name, f"v{version}.h5")
         if not os.path.exists(model_path):
-            return jsonify({"error": f"Model {model_name} version {version} not found"}), 404
+            return jsonify({"error": f"Model {model_path} {architecture} {model_name} version {version} not found"}), 404
 
         model = tf.keras.models.load_model(model_path)
         
         # Evaluate the model
         thresholds = [0.5] * len(CLASS_LABELS)
-        evaluation_results = {
-            f"{model_name}_v{version}": evaluate_model(model, X_test, y_test, CLASS_LABELS, thresholds)
+        model_key = f"{model_name}_{architecture}_v{version}"
+        
+        response_data = {
+            "evaluation": evaluate_model(model, X_test, y_test, CLASS_LABELS, thresholds),
+            "message": "Model evaluated successfully"
         }
 
+        # Convert numpy types to native Python types
         def convert_numpy_types(obj):
             if isinstance(obj, dict):
                 return {k: convert_numpy_types(v) for k, v in obj.items()}
@@ -901,18 +915,16 @@ def evaluate_classification_model(model_name, version):
             else:
                 return obj
 
-        cleaned_evaluation_results = convert_numpy_types(evaluation_results)
+        cleaned_response = convert_numpy_types(response_data)
 
-        return jsonify({
-            "message": "Model evaluated successfully",
-            "evaluation": cleaned_evaluation_results
-        })
+        return jsonify(cleaned_response)
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     
-@app.route('/evaluate_forecasting_model/<model_name>/<version>', methods=['POST'])
-def evaluate_forecasting_model(model_name, version):
+
+@app.route('/evaluate_forecasting_model/<architecture>/<model_name>/<version>', methods=['POST'])
+def evaluate_forecasting_model(architecture, model_name, version):
     try:
         data = request.json
         if not data or not isinstance(data, list):
@@ -955,7 +967,7 @@ def evaluate_forecasting_model(model_name, version):
         test_timestamps = test.index[FORECAST_WINDOW:-FORECAST_HORIZON]
         
         # Load the specific model version
-        model_path = os.path.join(FORECAST_MODEL_DIR, model_name, f"v{version}.h5")
+        model_path = os.path.join(FORECAST_MODEL_DIR, model_name, architecture, f"v{version}.h5")
         if not os.path.exists(model_path):
             return jsonify({"error": f"Model {model_name} version {version} not found"}), 404
 
@@ -1013,21 +1025,18 @@ def evaluate_forecasting_model(model_name, version):
             })
         
         evaluation_results = {
-            f"{model_name}_v{version}": {
                 "overall_metrics": overall_metrics,
                 "step_metrics": step_metrics,
                 "visualization_data": visualization_data,
                 "test_samples": len(X_test),
                 "original_version": f"{model_name}_v{version}",
             }
-        }
 
         return jsonify({
             "message": "Model evaluated successfully",
             "results": evaluation_results,
             "forecast_horizon": FORECAST_HORIZON
         })
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1039,49 +1048,69 @@ import os
 import shutil
 
 def get_model_info(directory):
-    """Get all models in directory and identify current model"""
-    models = []
-    current_model = None
+    """Get all models in directory with architecture and version info"""
+    model_data = {
+        "model_type": "classification" if "classification" in directory else "forecasting",
+        "architectures": []
+    }
     
-    # Get model type (classification or forecasting)
-    model_type = "classification" if "classification" in directory else "forecasting"
-    
-    # Scan each model subdirectory
-    for model_name in os.listdir(directory):
-        model_dir = os.path.join(directory, model_name)
-        if os.path.isdir(model_dir):
-            # Check for model files in this model's directory
-            for file in os.listdir(model_dir):
-                if file.endswith('.h5'):
-                    model_path = os.path.join(model_dir, file)
-                    is_current = "(current)" in file.lower()
-                    creation_timestamp = os.path.getctime(model_path)
+    # Get all model types (cnn, lstm, rnn)
+    for model_type in os.listdir(directory):
+        model_type_dir = os.path.join(directory, model_type)
+        if not os.path.isdir(model_type_dir):
+            continue
+            
+        # Get all architectures for this model type
+        for archi in os.listdir(model_type_dir):
+            archi_dir = os.path.join(model_type_dir, archi)
+            if not os.path.isdir(archi_dir):
+                continue
+                
+            archi_data = {
+                "model_type": model_type,
+                "architecture": archi,
+                "versions": [],
+                "current_version": None
+            }
+            
+            # Get all versions in this architecture
+            for version_file in os.listdir(archi_dir):
+                if version_file.endswith('.h5'):
+                    version_name = version_file.replace('.h5', '')
+                    is_current = "(current)" in version_name.lower()
+                    version_name = version_name.replace('(current)', '').strip()
+                    
+                    version_path = os.path.join(archi_dir, version_file)
+                    creation_timestamp = os.path.getctime(version_path)
                     creation_date = datetime.datetime.fromtimestamp(creation_timestamp).strftime('%Y-%m-%d %H:%M')
-                    print(creation_timestamp)
-                    models.append({
-                        "name": model_name,
-                        "version": file.replace('.h5', '').replace('(current)', '').strip(),
-                        "path": model_path,
+                    
+                    version_data = {
+                        "name": version_name,
+                        "path": version_path,
                         "is_current": is_current,
-                        "is_tuned": "_tuned" in file.lower(),
                         "creation_date": creation_date,
-                    })
+                        "is_tuned": "_tuned" in version_file.lower()
+                    }
+                    
+                    archi_data["versions"].append(version_data)
                     
                     if is_current:
-                        current_model = model_name
+                        archi_data["current_version"] = version_name
+            
+            # Sort versions by creation date (newest first)
+            archi_data["versions"].sort(key=lambda x: x["creation_date"], reverse=True)
+            model_data["architectures"].append(archi_data)
     
-    return {
-        "models": models,
-        "current_model": current_model
-    }
+    return model_data
+
 
 @app.route('/available_classification_models', methods=['GET'])
 def get_available_classification_models():
     try:
         model_info = get_model_info(CLASSIFICATION_MODEL_DIR)
         return jsonify({
-            "models": model_info["models"],
-            "current_model": model_info["current_model"]
+            "model_type": model_info["model_type"],
+            "architectures": model_info["architectures"]
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1091,14 +1120,14 @@ def get_available_forecasting_models():
     try:
         model_info = get_model_info(FORECAST_MODEL_DIR)
         return jsonify({
-            "models": model_info["models"],
-            "current_model": model_info["current_model"]
+            "model_type": model_info["model_type"],
+            "architectures": model_info["architectures"]
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/set_active_model/<model_type>/<model_name>/<version>', methods=['POST'])
-def set_active_model(model_type, model_name, version):
+@app.route('/set_active_model/<model_type>/<architecture>/<model_name>/<version>', methods=['POST'])
+def set_active_model(model_type, architecture, model_name, version):
     try:
         # Validate model type
         valid_types = ["classification", "forecasting"]
@@ -1107,11 +1136,12 @@ def set_active_model(model_type, model_name, version):
         
         # Set base directory
         base_dir = os.path.join("models", model_type)
-        model_dir = os.path.join(base_dir, model_name)
+        architecture_dir = os.path.join(base_dir, architecture)
+        model_dir = os.path.join(architecture_dir, model_name)
         
         # Verify model directory exists
         if not os.path.exists(model_dir):
-            return jsonify({"error": f"Model directory {model_name} not found"}), 404
+            return jsonify({"error": f"Model directory {architecture}/{model_name} not found"}), 404
         
         # Find the requested model file
         target_file = None
@@ -1122,9 +1152,9 @@ def set_active_model(model_type, model_name, version):
                 break
         
         if not target_file:
-            return jsonify({"error": f"Version {version} not found in {model_name}"}), 404
+            return jsonify({"error": f"Version {version} not found in {architecture}/{model_name}"}), 404
         
-        # Remove (current) tag from all models in this model_type
+        # Remove (current) tag from ALL models in this model_type (entire classification/forecasting folder)
         for root, dirs, files in os.walk(base_dir):
             for file in files:
                 if '(current)' in file and file.endswith('.h5'):
@@ -1142,9 +1172,10 @@ def set_active_model(model_type, model_name, version):
             new_path = target_file
         
         return jsonify({
-            "message": f"{model_name} {version} set as active",
+            "message": f"{architecture}/{model_name} {version} set as active",
             "current_model": new_path,
-            "model_type": model_type
+            "model_type": model_type,
+            "architecture": architecture
         })
         
     except Exception as e:
@@ -1156,8 +1187,8 @@ def set_active_model(model_type, model_name, version):
 #---------------------Delete model endpoint---------------------------------------------------
 
 
-@app.route('/delete_model/<model_type>/<model_name>/<version>', methods=['DELETE'])
-def delete_model(model_type, model_name, version):
+@app.route('/delete_model/<model_type>/<model_name>/<architecture>/<version>', methods=['DELETE'])
+def delete_model(model_type, architecture, model_name, version):
     try:
         # Validate model type
         valid_types = ["classification", "forecasting"]
@@ -1167,31 +1198,32 @@ def delete_model(model_type, model_name, version):
                 "status": 400
             }), 400
         
-        # Set base directory
+        # Set base directory with architecture
         base_dir = os.path.join("models", model_type)
         model_dir = os.path.join(base_dir, model_name)
+        architecture_dir = os.path.join(model_dir, architecture)
         
         # Verify model directory exists
-        if not os.path.exists(model_dir):
+        if not os.path.exists(architecture_dir):
             return jsonify({
-                "error": f"Model directory '{model_name}' not found",
+                "error": f"Model directory '{architecture}/{model_name}' not found",
                 "status": 404
             }), 404
         
         # Find the exact version match (handles cases where version is subset of another)
         target_file = None
-        for file in os.listdir(model_dir):
+        for file in os.listdir(architecture_dir):
             # Extract clean version (handles v1, v1(current), etc.)
             file_version = file.split('(')[0].replace('.h5', '')
             if version == file_version and file.endswith('.h5'):
-                target_file = os.path.join(model_dir, file)
+                target_file = os.path.join(architecture_dir, file)
                 break
         
         if not target_file:
             return jsonify({
                 "error": f"Version '{version}' not found in model '{model_name}'",
                 "available_versions": [f.split('(')[0].replace('.h5', '') 
-                                    for f in os.listdir(model_dir) if f.endswith('.h5')],
+                                    for f in os.listdir(architecture_dir) if f.endswith('.h5')],
                 "status": 404
             }), 404
         
@@ -1203,7 +1235,7 @@ def delete_model(model_type, model_name, version):
             }), 400
         
         # Additional safety check - don't delete if this is the only model
-        model_files = [f for f in os.listdir(model_dir) if f.endswith('.h5')]
+        model_files = [f for f in os.listdir(architecture_dir) if f.endswith('.h5')]
         if len(model_files) <= 1:
             return jsonify({
                 "error": "Cannot delete the only remaining model version",
@@ -1215,8 +1247,8 @@ def delete_model(model_type, model_name, version):
         
         # If directory is empty, remove it (with additional checks)
         try:
-            if not os.listdir(model_dir):
-                os.rmdir(model_dir)
+            if not os.listdir(architecture_dir):
+                os.rmdir(architecture_dir)
                 return jsonify({
                     "message": f"Model '{model_name}' version '{version}' deleted and directory removed",
                     "deleted_path": target_file,
@@ -1239,6 +1271,650 @@ def delete_model(model_type, model_name, version):
             "error": f"Failed to delete model: {str(e)}",
             "status": 500
         }), 500
+
+@app.route('/train_new_model', methods=['POST'])
+def train_new_model():
+    try:
+        # Parse request data
+        request_data = request.json
+        data = request_data.get('data')
+        config = request_data.get('config')
+        
+        if not data or not isinstance(data, list):
+            return jsonify({"error": "Input data must be a non-empty array"}), 400
+
+        # Prepare data
+        df = pd.DataFrame(data)
+
+        if "Timestamp" not in df.columns:
+            return jsonify({"error": "Missing Timestamp"}), 400
+
+        if "Month" not in df.columns:
+            df["Month"] = pd.to_datetime(df["Timestamp"]).dt.month
+
+        missing_features = [col for col in FEATURE_COLUMNS if col not in df.columns]
+        if missing_features:
+            return jsonify({"error": f"Missing required feature columns: {missing_features}"}), 400
+
+        missing_labels = [col for col in CLASS_LABELS if col not in df.columns]
+        if missing_labels:
+            return jsonify({"error": f"Missing fault label columns: {missing_labels}"}), 400
+
+        if "Asset_ID" in df.columns:
+            df = df.drop("Asset_ID", axis=1)
+
+        df = df.drop("Timestamp", axis=1)
+
+        X = df[FEATURE_COLUMNS].values.astype(np.float32)
+        y = df[CLASS_LABELS].values.astype(int)
+        X = np.expand_dims(X, axis=1)
+
+        # Split data
+        from sklearn.model_selection import train_test_split
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+        # Create appropriate hypermodel based on config
+        if config['modelType'] == 'CNN':
+            hypermodel = CNNHyperModelCustom(config)
+        elif config['modelType'] == 'LSTM':
+            hypermodel = LSTMHyperModelCustom(config)
+        elif config['modelType'] == 'RNN':
+            hypermodel = RNNHyperModelCustom(config)
+        else:
+            return jsonify({"error": "Invalid model type"}), 400
+
+        # Setup tuner
+        tuner = kt.BayesianOptimization(
+            hypermodel,
+            objective='val_loss',
+            max_trials=config['maxTrials'],
+            executions_per_trial=config['executionsPerTrial'],
+            directory=TUNER_DIR,
+            project_name=f"{config['modelType'].lower()}_custom_training",
+            overwrite=True
+        )
+
+        # Early stopping
+        early_stop = EarlyStopping(
+            monitor='val_loss', 
+            patience=config['patience'], 
+            restore_best_weights=True
+        )
+
+        # Run search
+        tuner.search(
+            X_train, y_train,
+            epochs=config['epochs'],
+            validation_data=(X_test, y_test),
+            callbacks=[early_stop],
+            verbose=2
+        )
+
+        # Get best model
+        best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
+        best_model = tuner.hypermodel.build(best_hps)
+        
+        # Train final model
+        history = best_model.fit(
+            X_train, y_train,
+            epochs=config['epochs'],
+            batch_size=best_hps.get('batch_size'),
+            validation_data=(X_test, y_test),
+            callbacks=[early_stop],
+            verbose=2
+        )
+
+        # Create new architecture directory
+        model_type = config['modelType'].lower()
+        base_dir = os.path.join(CLASSIFICATION_MODEL_DIR, model_type)
+        
+        # Find next available architecture number
+        existing_archis = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))]
+        archi_numbers = [int(d.replace('architecture', '')) for d in existing_archis if d.startswith('architecture')]
+        next_archi_num = max(archi_numbers) + 1 if archi_numbers else 0
+        archi_dir = os.path.join(base_dir, f"architecture{next_archi_num}")
+        os.makedirs(archi_dir, exist_ok=True)
+
+        # Save model as v0
+        model_path = os.path.join(archi_dir, "v0.h5")
+        best_model.save(model_path)
+        
+        # Evaluate model
+        thresholds = [0.5] * len(CLASS_LABELS)
+        evaluation_results = evaluate_model(best_model, X_test, y_test, CLASS_LABELS, thresholds)
+
+        # Prepare hyperparameters response
+        hyperparameters = {
+            "model_type": config['modelType'],
+            "architecture": f"architecture{next_archi_num}",
+            "num_conv_layers": best_hps.values.get('num_conv_layers'),
+            "conv1_filters": best_hps.values.get('conv1_filters'),
+            "num_dense_layers": best_hps.values.get('num_dense_layers'),
+            "dense1_units": best_hps.values.get('dense1_units'),
+            "batch_size": best_hps.values.get('batch_size'),
+            "optimizer": best_hps.values.get('optimizer'),
+            "learning_rate": best_hps.values.get('learning_rate'),
+            "lstm_units": best_hps.values.get('lstm1_units'),
+            "num_lstm_layers": best_hps.values.get('num_lstm_layers'),
+            "rnn_units": best_hps.values.get('rnn1_units'),
+            "num_rnn_layers": best_hps.values.get('num_rnn_layers')
+        }
+
+        # Convert numpy types to native Python types
+        def convert_numpy_types(obj):
+            if isinstance(obj, dict):
+                return {k: convert_numpy_types(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_numpy_types(i) for i in obj]
+            elif isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            else:
+                return obj
+
+        cleaned_evaluation = convert_numpy_types(evaluation_results)
+
+        return jsonify({
+            "message": f"New {config['modelType']} model trained successfully",
+            "evaluation": {
+                f"{config['modelType']}_architecture{next_archi_num}": cleaned_evaluation
+            },
+            "hyperparameters": hyperparameters,
+            "model_path": model_path,
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+class CNNHyperModelCustom(kt.HyperModel):
+    def __init__(self, config):
+        self.config = config
+    
+    def build(self, hp):
+        model = Sequential()
+        
+        # Conv layers
+        num_conv_layers = hp.Choice('num_conv_layers', values=self.config.get('numConvLayers', [1, 2]))
+        model.add(Conv1D(
+            filters=hp.Choice('conv1_filters', values=self.config['convFilters']),
+            kernel_size=1,
+            activation="relu",
+            input_shape=(1, 18)
+        ))
+        
+        if num_conv_layers == 2:
+            model.add(Conv1D(
+                filters=hp.Choice('conv2_filters', values=self.config['convFilters']),
+                kernel_size=1,
+                activation="relu"
+            ))
+        
+        model.add(Flatten())
+        
+        # Dense layers
+        num_dense_layers = hp.Choice('num_dense_layers', values=self.config.get('numDenseLayers', [1, 2]))
+        model.add(Dense(
+            units=hp.Choice('dense1_units', values=self.config['denseUnits']),
+            activation='relu'
+        ))
+        
+        if num_dense_layers == 2:
+            model.add(Dense(
+                units=hp.Choice('dense2_units', values=self.config['denseUnits']),
+                activation='relu'
+            ))
+        
+        # Output layer
+        model.add(Dense(len(CLASS_LABELS), activation="sigmoid"))
+        
+        # Optimizer
+        optimizer = hp.Choice('optimizer', values=self.config['optimizers'])
+        learning_rate = hp.Choice('learning_rate', values=self.config['learningRates'])
+        
+        if optimizer == 'adam':
+            opt = Adam(learning_rate=learning_rate)
+        else:
+            opt = SGD(learning_rate=learning_rate, momentum=0.9)
+            
+        model.compile(optimizer=opt, loss='binary_crossentropy', metrics=[ThresholdedAccuracy(threshold=0.5)])
+        return model
+    
+    def fit(self, hp, model, *args, **kwargs):
+        return model.fit(
+            *args,
+            batch_size=hp.Choice("batch_size", self.config['batchSizes']),
+            **kwargs,
+        )
+
+class ThresholdedAccuracy(tf.keras.metrics.Metric):
+    def __init__(self, threshold=0.5, name="thresholded_accuracy", **kwargs):
+        super(ThresholdedAccuracy, self).__init__(name=name, **kwargs)
+        self.threshold = threshold
+        self.correct = self.add_weight(name="correct", initializer="zeros")
+        self.total = self.add_weight(name="total", initializer="zeros")
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_pred = tf.cast(y_pred > self.threshold, tf.int32)
+        y_true = tf.cast(y_true, tf.int32)
+        matches = tf.reduce_all(tf.equal(y_true, y_pred), axis=1)
+        self.correct.assign_add(tf.reduce_sum(tf.cast(matches, tf.float32)))
+        self.total.assign_add(tf.cast(tf.shape(y_true)[0], tf.float32))
+
+    def result(self):
+        return self.correct / self.total
+
+    def reset_states(self):
+        self.correct.assign(0.0)
+        self.total.assign(0.0)
+
+class LSTMHyperModelCustom(kt.HyperModel):
+    def __init__(self, config):
+        self.config = config
+    
+    def build(self, hp):
+        model = Sequential()
+        
+        # LSTM layers
+        num_lstm_layers = hp.Choice('num_lstm_layers', values=self.config.get('numLSTMLayers', [1, 2]))
+        model.add(LSTM(
+            units=hp.Choice('lstm1_units', values=self.config['lstmUnits']),
+            activation="tanh",
+            return_sequences=(num_lstm_layers == 2),
+            input_shape=(1, 18)
+        ))
+        
+        if num_lstm_layers == 2:
+            model.add(LSTM(
+                units=hp.Choice('lstm2_units', values=self.config['lstmUnits']),
+                activation="tanh"
+            ))
+        
+        # Output layer
+        model.add(Dense(len(CLASS_LABELS), activation="sigmoid"))
+        
+        # Optimizer
+        optimizer = hp.Choice('optimizer', values=self.config['optimizers'])
+        learning_rate = hp.Choice('learning_rate', values=self.config['learningRates'])
+        
+        if optimizer == 'adam':
+            opt = Adam(learning_rate=learning_rate)
+        else:
+            opt = SGD(learning_rate=learning_rate, momentum=0.9)
+            
+        model.compile(optimizer=opt, loss='binary_crossentropy', metrics=[ThresholdedAccuracy(threshold=0.5)])
+        return model
+    
+    def fit(self, hp, model, *args, **kwargs):
+        return model.fit(
+            *args,
+            batch_size=hp.Choice("batch_size", self.config['batchSizes']),
+            **kwargs,
+        )
+
+
+class RNNHyperModelCustom(kt.HyperModel):
+    def __init__(self, config):
+        self.config = config
+    
+    def build(self, hp):
+        model = Sequential()
+        
+        # RNN layers
+        num_rnn_layers = hp.Choice('num_rnn_layers', values=self.config.get('numRNNLayers', [1, 2]))
+        model.add(SimpleRNN(
+            units=hp.Choice('rnn1_units', values=self.config['rnnUnits']),
+            activation="tanh",
+            return_sequences=(num_rnn_layers == 2),
+            input_shape=(1,18)
+        ))
+        
+        if num_rnn_layers == 2:
+            model.add(SimpleRNN(
+                units=hp.Choice('rnn2_units', values=self.config['rnnUnits']),
+                activation="tanh"
+            ))
+        
+        # Output layer
+        model.add(Dense(len(CLASS_LABELS), activation="sigmoid"))
+        
+        # Optimizer
+        optimizer = hp.Choice('optimizer', values=self.config['optimizers'])
+        learning_rate = hp.Choice('learning_rate', values=self.config['learningRates'])
+        
+        if optimizer == 'adam':
+            opt = Adam(learning_rate=learning_rate)
+        else:
+            opt = SGD(learning_rate=learning_rate, momentum=0.9)
+            
+        model.compile(optimizer=opt, loss='binary_crossentropy', metrics=[ThresholdedAccuracy(threshold=0.5)])
+        return model
+    
+    def fit(self, hp, model, *args, **kwargs):
+        return model.fit(
+            *args,
+            batch_size=hp.Choice("batch_size", self.config['batchSizes']),
+            **kwargs,
+        )
+
+@app.route('/train_new_forecast_model', methods=['POST'])
+def train_new_forecast_model():
+    try:
+        request_data = request.json
+        data = request_data.get('data')
+        config = request_data.get('config')
+        
+        if not data or not isinstance(data, list):
+            return jsonify({"error": "Input data must be a non-empty array"}), 400
+
+        df = pd.DataFrame(data)
+        
+        # Validate input
+        if "Timestamp" not in df.columns:
+            return jsonify({"error": "Missing Timestamp"}), 400
+            
+        if "Power_Output" not in df.columns:
+            return jsonify({"error": "Missing Power_Output column"}), 400
+
+        # Prepare data
+        df["Timestamp"] = pd.to_datetime(df["Timestamp"])
+        df = df.set_index("Timestamp")
+        df = df[['Power_Output']].interpolate(method='linear')
+        df = df.resample('h').mean()
+        df = df.interpolate(method='linear')
+        
+        # Add MSTL components
+        prepared_data = add_mstl_components(df)
+        forecast_features = ['Power_Output', 'trend', 'residual', 'seasonal_12', 'seasonal_24']
+        
+        # Scale features
+        scaler = StandardScaler()
+        prepared_data[forecast_features] = scaler.fit_transform(prepared_data[forecast_features])
+        
+        # Split data
+        train_size = int(len(prepared_data) * 0.8)
+        train, test = prepared_data.iloc[:train_size], prepared_data.iloc[train_size:]
+        
+        # Create sequences
+        X_train, y_train = create_dataset(train[forecast_features], FORECAST_WINDOW, FORECAST_HORIZON)
+        X_test, y_test = create_dataset(test[forecast_features], FORECAST_WINDOW, FORECAST_HORIZON)
+        test_timestamps = test.index[FORECAST_WINDOW:-FORECAST_HORIZON]
+
+        # Create appropriate hypermodel based on config        
+        model_type = config['modelType'].lower()
+
+        if model_type == 'cnn':
+            hypermodel = CNNForecastHyperModelCustom(config)
+        elif model_type == 'lstm':
+            hypermodel = LSTMHyperModelCustom(config)
+        elif model_type == 'rnn':
+            hypermodel = RNNHyperModelCustom(config)
+        else:
+            return jsonify({"error": f"Invalid model type {model_type}"}), 400
+
+        # Setup tuner
+        tuner = kt.BayesianOptimization(
+            hypermodel,
+            objective='val_loss',
+            max_trials=config.get('maxTrials', 30),
+            executions_per_trial=config.get('executionsPerTrial', 1),
+            directory=TUNER_DIR,
+            project_name=f'{model_type}_forecast_tuning',
+            overwrite=True
+        )
+
+        early_stop = EarlyStopping(
+            monitor='val_loss',
+            patience=config.get('patience', 10),
+            restore_best_weights=True
+        )
+
+        # Run search
+        tuner.search(
+            X_train, y_train,
+            epochs=config.get('epochs', 100),
+            validation_data=(X_test, y_test),
+            callbacks=[early_stop],
+            verbose=2
+        )
+
+        # Get best model
+        best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
+        best_model = tuner.hypermodel.build(best_hps)
+        
+        # Train final model
+        history = best_model.fit(
+            X_train, y_train,
+            epochs=config.get('epochs', 100),
+            batch_size=best_hps.get('batch_size'),
+            validation_data=(X_test, y_test),
+            callbacks=[early_stop],
+            verbose=2
+        )
+
+        # Create new architecture directory
+        base_dir = os.path.join(FORECAST_MODEL_DIR, model_type)
+        os.makedirs(base_dir, exist_ok=True)
+        
+        # Find next available architecture number
+        existing_archis = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))]
+        archi_numbers = [int(d.replace('architecture', '')) for d in existing_archis if d.startswith('architecture')]
+        next_archi_num = max(archi_numbers) + 1 if archi_numbers else 0
+        archi_dir = os.path.join(base_dir, f"architecture{next_archi_num}")
+        os.makedirs(archi_dir, exist_ok=True)
+
+        # Save model as v0
+        model_path = os.path.join(archi_dir, "v0.h5")
+        best_model.save(model_path)
+        
+        # Evaluate model
+        y_pred = best_model.predict(X_test)
+        
+        # Inverse transform predictions
+        def inverse_transform_predictions(predictions):
+            dummy = np.zeros((predictions.shape[0] * predictions.shape[1], len(forecast_features)))
+            dummy[:, 0] = predictions.ravel()
+            inv = scaler.inverse_transform(dummy)
+            return inv[:, 0].reshape(predictions.shape)
+        
+        y_test_inv = inverse_transform_predictions(y_test)
+        y_pred_inv = inverse_transform_predictions(y_pred)
+        
+        # Calculate metrics
+        overall_metrics = evaluate_forecast(y_test_inv, y_pred_inv)
+        step_metrics = evaluate_forecast_by_step(y_test_inv, y_pred_inv)
+        
+        # Prepare visualization data
+        visualization_data = []
+        for i in range(min(len(X_test), 5)):
+            input_start = test_timestamps[i]
+            input_timestamps = [input_start + pd.Timedelta(hours=j) for j in range(FORECAST_WINDOW)]
+            
+            true_start = input_start + pd.Timedelta(hours=FORECAST_WINDOW)
+            true_timestamps = [true_start + pd.Timedelta(hours=j) for j in range(FORECAST_HORIZON)]
+            
+            input_values = scaler.inverse_transform(X_test[i])[:, 0].tolist()
+            
+            visualization_data.append({
+                "input_sequence": {
+                    "timestamps": [ts.isoformat() for ts in input_timestamps],
+                    "values": input_values
+                },
+                "true_values": {
+                    "timestamps": [ts.isoformat() for ts in true_timestamps],
+                    "values": y_test_inv[i].tolist()
+                },
+                "predicted_values": {
+                    "timestamps": [ts.isoformat() for ts in true_timestamps],
+                    "values": y_pred_inv[i].tolist()
+                }
+            })
+
+        # Prepare hyperparameters response - model specific
+        # Prepare hyperparameters response
+        hyperparameters = {
+            "model_type": model_type.upper(),
+            "architecture": f"architecture{next_archi_num}",
+            "optimizer": best_hps.values['optimizer'],
+            "learning_rate": best_hps.values['learning_rate'],
+            "batch_size": best_hps.values['batch_size']
+        }
+
+        if model_type == 'cnn':
+            hyperparameters.update({
+                "num_conv_layers": best_hps.values['num_conv_layers'],
+                "conv1_filters": [best_hps.values[f'filters_{i+1}'] 
+                           for i in range(best_hps.values['num_conv_layers'])],
+                "kernel_sizes": [best_hps.values[f'kernel_size_{i+1}'] 
+                               for i in range(best_hps.values['num_conv_layers'])],
+                "num_dense_layers": best_hps.values['num_dense_layers'],
+                "dense1_units": [best_hps.values[f'units_{i+1}'] 
+                        for i in range(best_hps.values['num_dense_layers'])],
+                "use_dropout": best_hps.values.get('use_dropout', False),
+                "dropout_rate": best_hps.values.get('dropout_rate', 0)
+            })
+        elif model_type in ['lstm', 'rnn']:
+            hyperparameters.update({
+                "num_layers": best_hps.get('num_layers'),
+                "units": [best_hps.get(f'units_{i+1}') for i in range(best_hps.get('num_layers'))],
+                "activation": best_hps.get('activation'),
+                "use_dropout": best_hps.get('use_dropout'),
+                "dropout_rate": best_hps.get('dropout_rate') if best_hps.get('use_dropout') else None
+            })
+
+        return jsonify({
+            "message": f"New {model_type.upper()} forecasting model trained successfully",
+            "results": {
+                f"{model_type}_architecture{next_archi_num}": {
+                    "overall_metrics": overall_metrics,
+                    "step_metrics": step_metrics,
+                    "visualization_data": visualization_data,
+                    "train_samples": len(X_train),
+                    "test_samples": len(X_test)
+                }
+            },
+            "hyperparameters": hyperparameters,
+            "model_path": model_path,
+            "forecast_horizon": FORECAST_HORIZON
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "error": str(e),
+            "message": "Failed to train model",
+            "config_received": config
+        }), 500
+    
+class CNNForecastHyperModelCustom(kt.HyperModel):
+    def __init__(self, config):
+        self.config = config
+        self.input_shape = (FORECAST_WINDOW, 5)  # (timesteps, features)
+        self.output_units = FORECAST_HORIZON
+    
+    def build(self, hp):
+        model = Sequential()
+        # Conv1D layers
+        num_conv_layers = hp.Int('num_conv_layers', 1, 2)
+        for i in range(num_conv_layers):
+            model.add(Conv1D(
+                filters=hp.Choice(f'filters_{i+1}', values=self.config['convFilters']),
+                kernel_size=hp.Int(f'kernel_size_{i+1}', 2, 5),
+                activation='relu',
+                padding='same',
+                input_shape=self.input_shape if i == 0 else None
+            ))
+            model.add(MaxPooling1D(pool_size=2))
+
+        model.add(Flatten())
+
+        # Dense layers
+        num_dense_layers = hp.Int('num_dense_layers', 1, 2)
+        for i in range(num_dense_layers):
+            model.add(Dense(
+                units=hp.Choice(f'units_{i+1}', values=self.config['denseUnits']),
+                activation='relu'
+            ))
+            if hp.Boolean('use_dropout'):
+                model.add(Dropout(hp.Float('dropout_rate', 0.1, 0.5)))
+
+        model.add(Dense(self.output_units))
+
+        # Optimizer
+        optimizer = hp.Choice('optimizer', values=self.config['optimizers'])
+        learning_rate = hp.Choice('learning_rate', values=self.config['learningRates'])
+
+        if optimizer == 'adam':
+            opt = Adam(learning_rate=learning_rate)
+        else:
+            opt = SGD(learning_rate=learning_rate, momentum=0.9)
+
+        model.compile(optimizer=opt, loss='mse', metrics=['mae'])
+        return model
+    
+    def fit(self, hp, model, *args, **kwargs):
+        return model.fit(
+            *args,
+            batch_size=hp.Choice('batch_size', values=self.config['batchSizes']),
+            **kwargs
+        )
+    
+
+class LSTMHyperModelCustom(kt.HyperModel):
+    def __init__(self, config):
+        self.config = config
+    
+    def build(self, hp):
+        model = Sequential()
+
+        # Number of LSTM layers
+        num_layers = hp.Int('num_layers', 
+                           min_value=self.config.get('numLSTMLayers', [1])[0], 
+                           max_value=self.config.get('numLSTMLayers', [2])[0])
+        
+        # LSTM layers
+        for i in range(num_layers):
+            units = hp.Choice(f'units_{i+1}', values=tuple(self.config['lstmUnits']))  # Convert to tuple
+            model.add(LSTM(
+                units,
+                return_sequences=(i < num_layers - 1),
+                input_shape=(None, 5) if i == 0 else None,
+                activation=hp.Choice('activation', values=tuple(self.config.get('activations', ['tanh'])))  # Convert to tuple
+            ))
+
+        # Dropout
+        if hp.Boolean('use_dropout'):
+            model.add(Dropout(
+                hp.Float('dropout_rate', 
+                        min_value=self.config.get('dropoutRates', [0.1])[0], 
+                        max_value=self.config.get('dropoutRates', [0.5])[0])
+            ))
+
+        # Output layer
+        model.add(Dense(FORECAST_HORIZON))
+
+        # Optimizer
+        optimizer = hp.Choice('optimizer', values=tuple(self.config['optimizers']))  # Convert to tuple
+        learning_rate = hp.Choice('learning_rate', values=tuple(self.config['learningRates']))  # Convert to tuple
+
+        if optimizer == 'adam':
+            opt = Adam(learning_rate=learning_rate)
+        else:
+            opt = SGD(learning_rate=learning_rate, momentum=0.9)
+
+        model.compile(optimizer=opt, loss='mse', metrics=['mae'])
+        return model
+    
+    def fit(self, hp, model, *args, **kwargs):
+        return model.fit(
+            *args,
+            batch_size=hp.Choice("batch_size", tuple(self.config['batchSizes'])),  # Convert to tuple
+            **kwargs,
+        )
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
