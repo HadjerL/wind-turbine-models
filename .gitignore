@@ -49,8 +49,8 @@ Thumbs.db
 secret_key.txt
 
 # Ignore all .h5 files
-*.h5
+# *.h5
 
 # But do not ignore v0.h5 files
-!**/v0.h5
-!**/v0(current).h5
+# !**/v0.h5
+# !**/v0(current).h5

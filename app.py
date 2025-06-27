@@ -390,8 +390,8 @@ def evaluate_model(model, X_test, y_test, class_columns, thresholds):
 tf.config.run_functions_eagerly(True)
 tf.compat.v1.enable_eager_execution()
 
-@app.route('/tune_models', methods=['POST'])
-def admin_tune_models():
+@app.route('/tune_classification_model/<model_type>/<architecture>/<version>', methods=['POST'])
+def tune_classification_model(model_type, architecture, version):
     try:
         data = request.json
         if not data or not isinstance(data, list):
@@ -399,6 +399,7 @@ def admin_tune_models():
 
         df = pd.DataFrame(data)
 
+        # Validate input data
         if "Timestamp" not in df.columns:
             return jsonify({"error": "Missing Timestamp"}), 400
 
@@ -418,97 +419,100 @@ def admin_tune_models():
 
         df = df.drop("Timestamp", axis=1)
 
+        # Prepare data
         X = df[FEATURE_COLUMNS].values.astype(np.float32)
         y = df[CLASS_LABELS].values.astype(int)
         X = np.expand_dims(X, axis=1)
 
-        from sklearn.model_selection import train_test_split
+        # Split data
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
         epochs = 1
         batch_size = 32
 
         evaluation_results = {}
-        new_versions = {}  # Will store only the newly created versions
+        new_versions = {}
+
+        # Load and tune the specific model version
+        model_path = os.path.join(CLASSIFICATION_MODEL_DIR, model_type, architecture, f"v{version}.h5")
+        if not os.path.exists(model_path):
+            return jsonify({"error": f"{model_path} Model version not found"}), 404
+
+        model = tf.keras.models.load_model(model_path)
         
-        # First find the latest version of each model type
-        latest_versions = {}
-        for model_type in os.listdir(CLASSIFICATION_MODEL_DIR):
-            model_dir = os.path.join(CLASSIFICATION_MODEL_DIR, model_type)
-            if os.path.isdir(model_dir):
-                versions = []
-                for f in os.listdir(model_dir):
-                    if f.startswith('v') and f.endswith('.h5'):
-                        try:
-                            version_num = int(f[1:-3])
-                            versions.append((version_num, f))
-                        except ValueError:
-                            continue
-                if versions:
-                    latest_version = max(versions, key=lambda x: x[0])
-                    latest_versions[model_type] = latest_version[1]  # 'v2.h5'
+        # Determine the next version number by finding the highest existing version
+        model_dir = os.path.join(CLASSIFICATION_MODEL_DIR, model_type, architecture)
+        existing_versions = []
+        if os.path.exists(model_dir):
+            for f in os.listdir(model_dir):
+                if f.startswith('v') and f.endswith('.h5'):
+                    try:
+                        ver_num = int(f[1:-3])
+                        existing_versions.append(ver_num)
+                    except ValueError:
+                        continue
+        
+        new_version_num = max(existing_versions) + 1 if existing_versions else 1
+        new_version_name = f"v{new_version_num}.h5"
+        
+        # Clone and train the model
+        model_clone = tf.keras.models.clone_model(model)
+        model_clone.set_weights(model.get_weights())
+        model_clone.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+        history = model_clone.fit(
+            X_train, y_train,
+            epochs=epochs,
+            batch_size=batch_size,
+            verbose=1
+        )
+        
+        # Save new version
+        os.makedirs(model_dir, exist_ok=True)
+        new_model_path = os.path.join(model_dir, new_version_name)
+        model_clone.save(new_model_path)
+        
+        # Evaluate the tuned model using the evaluate_model function
+        thresholds = [0.5] * len(CLASS_LABELS)
+        model_name = f"{model_type}_{architecture}_v{new_version_num}"
+        
+        # Get evaluation results
+        eval_results = evaluate_model(model_clone, X_test, y_test, CLASS_LABELS, thresholds)
+        
+        # Structure the evaluation results to match TypeScript interfaces
+        evaluation_results[model_name] = {
+            "class_pair_evaluation": eval_results["class_pair_evaluation"],
+            "evaluate_normal_vs_abnormal": eval_results["evaluate_normal_vs_abnormal"],
+            "evaluate_single_class": eval_results["evaluate_single_class"],
+            "multi_label_evaluation": eval_results["multi_label_evaluation"],
+            "original_version": f"{model_type}_{architecture}_v{version}",
+            "saved_path": new_model_path,
+            "is_tuned": True
+        }
 
-        for model_type, version_file in latest_versions.items():
-            try:
-                model_path = os.path.join(CLASSIFICATION_MODEL_DIR, model_type, version_file)
-                model = tf.keras.models.load_model(model_path)
-                
-                # Extract version info
-                version_num = int(version_file[1:-3])
-                new_version_num = version_num + 1
-                new_version_name = f"v{new_version_num}.h5"
-                
-                # Clone the model to avoid modifying the original
-                model_clone = tf.keras.models.clone_model(model)
-                model_clone.set_weights(model.get_weights())
-                
-                # Compile and train
-                model_clone.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
-                history = model_clone.fit(
-                    X_train, y_train,
-                    epochs=epochs,
-                    batch_size=batch_size,
-                    verbose=1
-                )
-                
-                # Save new version
-                model_dir = os.path.join(CLASSIFICATION_MODEL_DIR, model_type)
-                os.makedirs(model_dir, exist_ok=True)
-                new_model_path = os.path.join(model_dir, new_version_name)
-                model_clone.save(new_model_path)
-                
-                # Evaluate the model
-                thresholds = [0.5] * len(CLASS_LABELS)
-                response_key = f"{model_type}_v{new_version_num}"
-                new_versions[response_key] = {
-                    **evaluate_model(model_clone, X_test, y_test, CLASS_LABELS, thresholds),
-                    "original_version": f"{model_type}_{version_file.replace('.h5', '')}",
-                    "saved_path": new_model_path
-                }
-                
-                
-            except Exception as e:
-                evaluation_results[f"{model_type}_error"] = {"error": str(e)}
-                continue
-
-        evaluation_results.update(new_versions)
-
-        # Evaluate the current model without tuning
+        # Evaluate the current model for comparison
         try:
             current_model_path = get_current_model_path(CLASSIFICATION_MODEL_DIR)
             if current_model_path:
-                model_type = os.path.basename(os.path.dirname(current_model_path))
-                model_name = os.path.basename(current_model_path).replace('.h5', '')
+                current_model_type = os.path.basename(os.path.dirname(os.path.dirname(current_model_path)))
+                current_architecture = os.path.basename(os.path.dirname(current_model_path))
+                current_version = os.path.basename(current_model_path).replace('.h5', '')
                 
                 current_model = tf.keras.models.load_model(current_model_path)
-                thresholds = [0.5] * len(CLASS_LABELS)
-                evaluation_results[f"{model_type}_current"] = {
-                    **evaluate_model(current_model, X_test, y_test, CLASS_LABELS, thresholds),
-                    "note": "Original current model (not fine-tuned)"
+                current_eval_results = evaluate_model(current_model, X_test, y_test, CLASS_LABELS, thresholds)
+                
+                current_model_name = f"{current_model_type}_{current_architecture}_{current_version}"
+                evaluation_results[current_model_name] = {
+                    "class_pair_evaluation": current_eval_results["class_pair_evaluation"],
+                    "evaluate_normal_vs_abnormal": current_eval_results["evaluate_normal_vs_abnormal"],
+                    "evaluate_single_class": current_eval_results["evaluate_single_class"],
+                    "multi_label_evaluation": current_eval_results["multi_label_evaluation"],
+                    "note": "Original current model (not fine-tuned)",
+                    "is_current": True
                 }
         except Exception as e:
-            evaluation_results["current_model"] = {"error": str(e)}
+            evaluation_results["current_model_error"] = {"error": str(e)}
 
+        # Convert numpy types to native Python types
         def convert_numpy_types(obj):
             if isinstance(obj, dict):
                 return {k: convert_numpy_types(v) for k, v in obj.items()}
@@ -526,15 +530,13 @@ def admin_tune_models():
         cleaned_evaluation_results = convert_numpy_types(evaluation_results)
 
         return jsonify({
-            "message": "Latest models tuned successfully",
+            "message": f"Model {model_type} {architecture} v{version} tuned successfully",
             "evaluation": cleaned_evaluation_results,
-            "new_versions": list(new_versions.keys())
+            "new_versions": [model_name]
         })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-
 
 
 
@@ -607,9 +609,9 @@ def create_dataset(data, look_back=48, forecast_horizon=24, target_col="Power_Ou
     return np.array(X), np.array(y)
 
 
-@app.route('/tune_forecast', methods=['POST'])
-def tune_forecast():
-    """Endpoint for tuning forecasting models with version management"""
+@app.route('/tune_forecasting_model/<model_type>/<architecture>/<version>', methods=['POST'])
+def tune_forecasting_model(model_type, architecture, version):
+    """Endpoint for tuning a single forecasting model with version management"""
     try:
         data = request.json
         if not data or not isinstance(data, list):
@@ -656,93 +658,137 @@ def tune_forecast():
         batch_size = 32
         
         evaluation_results = {}
-        new_versions = {}  # Will store only the newly created versions
-        
-        # First find the latest version of each model type
-        latest_versions = {}
-        for model_type in os.listdir(FORECAST_MODEL_DIR):
-            model_dir = os.path.join(FORECAST_MODEL_DIR, model_type)
-            if os.path.isdir(model_dir):
-                versions = []
-                for f in os.listdir(model_dir):
-                    if f.startswith('v') and f.endswith('.h5'):
-                        try:
-                            version_num = int(f[1:-3])
-                            versions.append((version_num, f))
-                        except ValueError:
-                            continue
-                if versions:
-                    latest_version = max(versions, key=lambda x: x[0])
-                    latest_versions[model_type] = latest_version[1]  # 'v2.h5'
 
-        # Fine-tune each model with version management
-        for model_type, version_file in latest_versions.items():
-            try:
-                model_path = os.path.join(FORECAST_MODEL_DIR, model_type, version_file)
-                model = tf.keras.models.load_model(
-                    model_path,
+        # Load and tune the specific model version
+        model_path = os.path.join(FORECAST_MODEL_DIR, model_type, architecture, f"v{version}.h5")
+        if not os.path.exists(model_path):
+            return jsonify({"error": f"{model_path} Model version not found"}), 404
+
+        model = tf.keras.models.load_model(
+            model_path,
+            custom_objects={'mse': tf.keras.losses.MeanSquaredError()}
+        )
+
+        # Determine the next version number by finding the highest existing version
+        model_dir = os.path.join(FORECAST_MODEL_DIR, model_type, architecture)
+        existing_versions = []
+        if os.path.exists(model_dir):
+            for f in os.listdir(model_dir):
+                if f.startswith('v') and f.endswith('.h5'):
+                    try:
+                        ver_num = int(f[1:-3])
+                        existing_versions.append(ver_num)
+                    except ValueError:
+                        continue
+        
+        new_version_num = max(existing_versions) + 1 if existing_versions else 1
+        new_version_name = f"v{new_version_num}.h5"
+
+        # Clone and train the model
+        model_clone = tf.keras.models.clone_model(model)
+        model_clone.set_weights(model.get_weights())
+        model_clone.compile(optimizer='adam', loss='mse', metrics=['mae'])
+        history = model_clone.fit(
+            X_train, y_train,
+            epochs=epochs,
+            batch_size=batch_size,
+            validation_split=0.1,
+            verbose=1
+        )
+        
+        # Save new version
+        os.makedirs(model_dir, exist_ok=True)
+        new_model_path = os.path.join(model_dir, new_version_name)
+        model_clone.save(new_model_path)
+        
+        # Evaluate the tuned model
+        y_pred = model_clone.predict(X_test)
+        
+        # Inverse transform predictions
+        def inverse_transform_predictions(predictions):
+            dummy = np.zeros((predictions.shape[0] * predictions.shape[1], len(forecast_features)))
+            dummy[:, 0] = predictions.ravel()
+            inv = scaler.inverse_transform(dummy)
+            return inv[:, 0].reshape(predictions.shape)
+        
+        y_test_inv = inverse_transform_predictions(y_test)
+        y_pred_inv = inverse_transform_predictions(y_pred)
+        
+        # Calculate metrics
+        overall_metrics = evaluate_forecast(y_test_inv, y_pred_inv)
+        step_metrics = evaluate_forecast_by_step(y_test_inv, y_pred_inv)
+        
+        # Prepare forecast visualization data
+        visualization_data = []
+        for i in range(min(len(X_test), 5)):  # Limit to 5 examples
+            input_start = test_timestamps[i]
+            input_timestamps = [input_start + pd.Timedelta(hours=j) for j in range(FORECAST_WINDOW)]
+            
+            true_start = input_start + pd.Timedelta(hours=FORECAST_WINDOW)
+            true_timestamps = [true_start + pd.Timedelta(hours=j) for j in range(FORECAST_HORIZON)]
+            
+            input_values = scaler.inverse_transform(X_test[i])[:, 0].tolist()
+            
+            visualization_data.append({
+                "input_sequence": {
+                    "timestamps": [ts.isoformat() for ts in input_timestamps],
+                    "values": input_values
+                },
+                "true_values": {
+                    "timestamps": [ts.isoformat() for ts in true_timestamps],
+                    "values": y_test_inv[i].tolist()
+                },
+                "predicted_values": {
+                    "timestamps": [ts.isoformat() for ts in true_timestamps],
+                    "values": y_pred_inv[i].tolist()
+                }
+            })
+        
+        # Create model name in the format expected by the frontend
+        model_name = f"{model_type}_{architecture}_v{new_version_num}"
+        evaluation_results[model_name] = {
+            "overall_metrics": overall_metrics,
+            "step_metrics": step_metrics,
+            "visualization_data": visualization_data,
+            "train_samples": len(X_train),
+            "test_samples": len(X_test),
+            "original_version": f"{model_type}_{architecture}_v{version}",
+            "saved_path": new_model_path,
+            "is_tuned": True
+        }
+
+        # Evaluate the current model for comparison
+        try:
+            current_model_path = get_current_model_path(FORECAST_MODEL_DIR)
+            if current_model_path:
+                current_model_type = os.path.basename(os.path.dirname(os.path.dirname(current_model_path)))
+                current_architecture = os.path.basename(os.path.dirname(current_model_path))
+                current_version = os.path.basename(current_model_path).replace('.h5', '')
+                
+                current_model = tf.keras.models.load_model(
+                    current_model_path,
                     custom_objects={'mse': tf.keras.losses.MeanSquaredError()}
                 )
-
-                # Extract version info
-                version_num = int(version_file[1:-3])
-                new_version_num = version_num + 1
-                new_version_name = f"v{new_version_num}.h5"
-
-                # Clone the model to avoid modifying the original
-                model_clone = tf.keras.models.clone_model(model)
-                model_clone.set_weights(model.get_weights())
                 
-                # Compile and train
-                model_clone.compile(optimizer='adam', loss='mse', metrics=['mae'])
-                history = model_clone.fit(
-                    X_train, y_train,
-                    epochs=epochs,
-                    batch_size=batch_size,
-                    validation_split=0.1,
-                    verbose=1
-                )
+                y_pred_current = current_model.predict(X_test)
+                y_pred_current_inv = inverse_transform_predictions(y_pred_current)
+            
+                # Calculate metrics for current model
+                overall_metrics_current = evaluate_forecast(y_test_inv, y_pred_current_inv)
+                step_metrics_current = evaluate_forecast_by_step(y_test_inv, y_pred_current_inv)
                 
-                # Save new version
-                model_dir = os.path.join(FORECAST_MODEL_DIR, model_type)
-                os.makedirs(model_dir, exist_ok=True)
-                new_model_path = os.path.join(model_dir, new_version_name)
-                model_clone.save(new_model_path)
-                
-                # Evaluate
-                y_pred = model_clone.predict(X_test)
-                
-                # Inverse transform all at once for proper scaling
-                def inverse_transform_predictions(predictions):
-                    # Create array with same shape as original features
-                    dummy = np.zeros((predictions.shape[0] * predictions.shape[1], len(forecast_features)))
-                    # Only fill the Power_Output column
-                    dummy[:, 0] = predictions.ravel()
-                    # Inverse transform
-                    inv = scaler.inverse_transform(dummy)
-                    # Reshape back to original prediction shape
-                    return inv[:, 0].reshape(predictions.shape)
-                
-                y_test_inv = inverse_transform_predictions(y_test)
-                y_pred_inv = inverse_transform_predictions(y_pred)
-                
-                # Calculate metrics
-                overall_metrics = evaluate_forecast(y_test_inv, y_pred_inv)
-                step_metrics = evaluate_forecast_by_step(y_test_inv, y_pred_inv)
-                
-                # Prepare forecast visualization data
-                visualization_data = []
-                for i in range(min(len(X_test), 5)):  # Limit to 5 examples
+                # Prepare visualization data for current model
+                visualization_data_current = []
+                for i in range(min(len(X_test), 5)):
                     input_start = test_timestamps[i]
                     input_timestamps = [input_start + pd.Timedelta(hours=j) for j in range(FORECAST_WINDOW)]
                     
                     true_start = input_start + pd.Timedelta(hours=FORECAST_WINDOW)
                     true_timestamps = [true_start + pd.Timedelta(hours=j) for j in range(FORECAST_HORIZON)]
                     
-                    # Get the power output values (index 0 in our features)
                     input_values = scaler.inverse_transform(X_test[i])[:, 0].tolist()
                     
-                    visualization_data.append({
+                    visualization_data_current.append({
                         "input_sequence": {
                             "timestamps": [ts.isoformat() for ts in input_timestamps],
                             "values": input_values
@@ -753,95 +799,47 @@ def tune_forecast():
                         },
                         "predicted_values": {
                             "timestamps": [ts.isoformat() for ts in true_timestamps],
-                            "values": y_pred_inv[i].tolist()
+                            "values": y_pred_current_inv[i].tolist()
                         }
                     })
                 
-                response_key = f"{model_type}_v{new_version_num}"
-                new_versions[response_key] = {
-                    "overall_metrics": overall_metrics,
-                    "step_metrics": step_metrics,
-                    "visualization_data": visualization_data,
+                current_model_name = f"{current_model_type}_{current_architecture}_{current_version}"
+                evaluation_results[current_model_name] = {
+                    "overall_metrics": overall_metrics_current,
+                    "step_metrics": step_metrics_current,
+                    "visualization_data": visualization_data_current,
                     "train_samples": len(X_train),
                     "test_samples": len(X_test),
-                    "original_version": f"{model_type}_{version_file.replace('.h5', '')}",
-                    "saved_path": new_model_path
+                    "note": "Original current model (not fine-tuned)",
+                    "is_current": True
                 }
-                
-            except Exception as e:
-                evaluation_results[f"{model_type}_error"] = {"error": str(e)}
-                continue
-        
-        # Only include newly created versions in results
-        evaluation_results.update(new_versions)
-        
-        # Evaluate the current LSTM model without tuning
-        try:
-            current_model_path = get_current_model_path(FORECAST_MODEL_DIR)
-            if current_model_path:
-                model_type = os.path.basename(os.path.dirname(current_model_path))
-                model_name = os.path.basename(current_model_path).replace('.h5', '')
-                
-                current_model = tf.keras.models.load_model(
-                    current_model_path,
-                    custom_objects={'mse': tf.keras.losses.MeanSquaredError()}
-                )
-                
-                y_pred_current = current_model.predict(X_test)
-                y_pred_current_inv = inverse_transform_predictions(y_pred_current)
-            
-            # Calculate metrics for current model
-            overall_metrics_current = evaluate_forecast(y_test_inv, y_pred_current_inv)
-            step_metrics_current = evaluate_forecast_by_step(y_test_inv, y_pred_current_inv)
-            
-            # Prepare visualization data for current model
-            visualization_data_current = []
-            for i in range(min(len(X_test), 5)):
-                input_start = test_timestamps[i]
-                input_timestamps = [input_start + pd.Timedelta(hours=j) for j in range(FORECAST_WINDOW)]
-                
-                true_start = input_start + pd.Timedelta(hours=FORECAST_WINDOW)
-                true_timestamps = [true_start + pd.Timedelta(hours=j) for j in range(FORECAST_HORIZON)]
-                
-                input_values = scaler.inverse_transform(X_test[i])[:, 0].tolist()
-                
-                visualization_data_current.append({
-                    "input_sequence": {
-                        "timestamps": [ts.isoformat() for ts in input_timestamps],
-                        "values": input_values
-                    },
-                    "true_values": {
-                        "timestamps": [ts.isoformat() for ts in true_timestamps],
-                        "values": y_test_inv[i].tolist()
-                    },
-                    "predicted_values": {
-                        "timestamps": [ts.isoformat() for ts in true_timestamps],
-                        "values": y_pred_current_inv[i].tolist()
-                    }
-                })
-            
-            evaluation_results[f"{model_type}_current"] = {
-                "overall_metrics": evaluate_forecast(y_test_inv, y_pred_current_inv),
-                "step_metrics": evaluate_forecast_by_step(y_test_inv, y_pred_current_inv),
-                "visualization_data": visualization_data_current,
-                "train_samples": len(X_train),
-                "test_samples": len(X_test),
-                "note": "Original current model (not fine-tuned)"
-            }
-            
         except Exception as e:
             evaluation_results["current_model_error"] = {"error": str(e)}
 
+        # Extract hyperparameters for the newly tuned model
+        hyperparams = {
+            "model_type": model_type,
+            "architecture": architecture,
+            "batch_size": batch_size,
+            "optimizer": "adam",
+            "learning_rate": 0.001,
+            "epochs": epochs,
+            "forecast_horizon": FORECAST_HORIZON,
+            "window_size": FORECAST_WINDOW,
+        }
+
         return jsonify({
-            "message": "Latest models tuned successfully",
+            "message": f"Model {model_type} {architecture} v{version} tuned successfully",
             "results": evaluation_results,
             "forecast_horizon": FORECAST_HORIZON,
-            "new_versions": list(new_versions.keys())
+            "hyperparameters": hyperparams,
+            "new_versions": [model_name]
         })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-    
+
+
 
 
 #--------------------------------------------------------------------------------------------------------------------
