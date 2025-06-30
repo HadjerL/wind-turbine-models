@@ -1647,7 +1647,7 @@ def train_new_forecast_model():
         if model_type == 'cnn':
             hypermodel = CNNForecastHyperModelCustom(config)
         elif model_type == 'lstm':
-            hypermodel = LSTMHyperModelCustom(config)
+            hypermodel = L(config)
         elif model_type == 'rnn':
             hypermodel = RNNHyperModelCustom(config)
         else:
@@ -1766,8 +1766,7 @@ def train_new_forecast_model():
                 "num_conv_layers": best_hps.values['num_conv_layers'],
                 "conv1_filters": [best_hps.values[f'filters_{i+1}'] 
                            for i in range(best_hps.values['num_conv_layers'])],
-                "kernel_sizes": [best_hps.values[f'kernel_size_{i+1}'] 
-                               for i in range(best_hps.values['num_conv_layers'])],
+        
                 "num_dense_layers": best_hps.values['num_dense_layers'],
                 "dense1_units": [best_hps.values[f'units_{i+1}'] 
                         for i in range(best_hps.values['num_dense_layers'])],
@@ -1821,12 +1820,11 @@ class CNNForecastHyperModelCustom(kt.HyperModel):
         for i in range(num_conv_layers):
             model.add(Conv1D(
                 filters=hp.Choice(f'filters_{i+1}', values=self.config['convFilters']),
-                kernel_size=hp.Int(f'kernel_size_{i+1}', 2, 5),
+                kernel_size=1,
                 activation='relu',
                 padding='same',
                 input_shape=self.input_shape if i == 0 else None
             ))
-            model.add(MaxPooling1D(pool_size=2))
 
         model.add(Flatten())
 
@@ -1862,7 +1860,7 @@ class CNNForecastHyperModelCustom(kt.HyperModel):
         )
     
 
-class LSTMHyperModelCustom(kt.HyperModel):
+class LSTMForecastingHyperModelCustom(kt.HyperModel):
     def __init__(self, config):
         self.config = config
     
